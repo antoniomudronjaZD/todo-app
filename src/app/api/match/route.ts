@@ -19,24 +19,128 @@ interface MatchResult {
   title: string;
   location: string;
   url: string;
+  tags: string[];
+  remote: boolean;
   score: number;
   whyItFits: string;
   interviewQuestion: string;
 }
 
-export async function POST(request: NextRequest) {
-  const apiKey = process.env.OPENROUTER_API_KEY;
+function tokenize(text: string): string[] {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter((t) => t.length > 2);
+}
 
-  if (!apiKey) {
-    return Response.json(
-      {
-        error:
-          "OpenRouter API key is not configured. Please add OPENROUTER_API_KEY to your environment variables.",
-      },
-      { status: 500 }
+function computeScore(
+  skills: string[],
+  targetRole: string,
+  city: string,
+  job: Job
+): { score: number; skillHits: string[] } {
+  const jobText = `${job.title} ${job.tags.join(" ")} ${job.description}`.toLowerCase();
+  const jobTokens = new Set(tokenize(jobText));
+
+  let skillHits: string[] = [];
+  let skillScore = 0;
+
+  for (const skill of skills) {
+    const skillLower = skill.toLowerCase().trim();
+    if (!skillLower) continue;
+    if (jobText.includes(skillLower)) {
+      skillHits.push(skill.trim());
+      skillScore += 15;
+    } else {
+      const skillTokens = tokenize(skillLower);
+      for (const st of skillTokens) {
+        if (jobTokens.has(st)) {
+          skillHits.push(skill.trim());
+          skillScore += 5;
+          break;
+        }
+      }
+    }
+  }
+
+  let roleScore = 0;
+  const roleTokens = tokenize(targetRole);
+  for (const rt of roleTokens) {
+    if (jobTokens.has(rt)) roleScore += 10;
+  }
+
+  let locationScore = 0;
+  if (city) {
+    const cityLower = city.toLowerCase();
+    if (job.location.toLowerCase().includes(cityLower)) {
+      locationScore = 20;
+    } else if (job.remote && cityLower.includes("remote")) {
+      locationScore = 20;
+    } else if (job.remote) {
+      locationScore = 5;
+    }
+  }
+
+  const score = Math.min(100, skillScore + roleScore + locationScore);
+  return { score, skillHits: [...new Set(skillHits)] };
+}
+
+function generateWhyItFits(
+  skillHits: string[],
+  targetRole: string,
+  job: Job,
+  city: string
+): string {
+  const parts: string[] = [];
+
+  if (skillHits.length > 0) {
+    const listed = skillHits.slice(0, 3).join(", ");
+    parts.push(
+      `Your experience with ${listed} directly aligns with this role's requirements.`
+    );
+  } else {
+    parts.push(`This position is relevant to your ${targetRole} career path.`);
+  }
+
+  if (job.remote && city.toLowerCase().includes("remote")) {
+    parts.push("The remote work option matches your location preference.");
+  } else if (job.location.toLowerCase().includes(city.toLowerCase())) {
+    parts.push(`The ${job.location} location matches your preferred area.`);
+  } else {
+    parts.push(
+      `The position at ${job.company} offers valuable industry experience.`
     );
   }
 
+  return parts.join(" ");
+}
+
+function generateInterviewQuestion(
+  skillHits: string[],
+  job: Job
+): string {
+  if (skillHits.length > 0) {
+    const skill = skillHits[0];
+    const questions = [
+      `Can you walk me through a project where you used ${skill} to solve a real problem?`,
+      `How would you approach building a new feature using ${skill} in a team setting?`,
+      `Describe a challenging situation you faced while working with ${skill} and how you resolved it.`,
+      `What best practices do you follow when working with ${skill}?`,
+    ];
+    return questions[job.slug.length % questions.length];
+  }
+
+  const generic = [
+    `What interests you about working at ${job.company} as a ${job.title}?`,
+    `Describe a time you had to quickly learn a new technology for a project.`,
+    `How do you prioritize tasks when working on multiple features simultaneously?`,
+    `Tell me about a project you're most proud of and why.`,
+  ];
+  return generic[job.slug.length % generic.length];
+}
+
+export async function POST(request: NextRequest) {
   const body = await request.json();
   const { skills, targetRole, city, jobs } = body as {
     skills: string;
@@ -52,138 +156,29 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  const jobsSummary = jobs
-    .map(
-      (job, i) =>
-        `[${i + 1}] ${job.title} at ${job.company} in ${job.location}${job.remote ? " (Remote)" : ""}\nTags: ${job.tags.join(", ")}\nDescription: ${job.description}`
-    )
-    .join("\n\n");
+  const skillList = skills
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
 
-  const prompt = `You are a career matching assistant. A job seeker has the following profile:
+  const scored = jobs.map((job) => {
+    const { score, skillHits } = computeScore(skillList, targetRole, city, job);
+    return {
+      slug: job.slug,
+      company: job.company,
+      title: job.title,
+      location: job.location,
+      url: job.url,
+      tags: job.tags,
+      remote: job.remote,
+      score,
+      whyItFits: generateWhyItFits(skillHits, targetRole, job, city),
+      interviewQuestion: generateInterviewQuestion(skillHits, job),
+    };
+  });
 
-Skills: ${skills}
-Target Role: ${targetRole}
-Preferred City: ${city}
+  scored.sort((a, b) => b.score - a.score);
+  const top5 = scored.slice(0, 5);
 
-Here are ${jobs.length} job listings to evaluate:
-
-${jobsSummary}
-
-Score each job 0-100 based on how well it matches the seeker's profile. Consider skill overlap, role alignment, and location preference.
-
-Return ONLY a valid JSON array (no markdown, no code blocks) with exactly the top 5 jobs (or fewer if less than 5 exist), sorted by score descending. Each object must have:
-- "slug": the job slug
-- "score": integer 0-100
-- "whyItFits": exactly two sentences explaining the match
-- "interviewQuestion": one specific interview question the seeker should prepare for
-
-Example format:
-[{"slug":"abc","score":85,"whyItFits":"Your React experience directly matches their frontend needs. The remote option also aligns with your city preference.","interviewQuestion":"Can you describe a time you optimized a React component's performance?"}]`;
-
-  try {
-    const response = await fetch(
-      "https://openrouter.ai/api/v1/chat/completions",
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-          "HTTP-Referer": "https://my-job-matcher.vercel.app",
-          "X-Title": "My Job Matcher",
-        },
-        body: JSON.stringify({
-          model: "meta-llama/llama-3.1-8b-instruct:free",
-          messages: [{ role: "user", content: prompt }],
-          temperature: 0.3,
-          max_tokens: 2000,
-        }),
-      }
-    );
-
-    if (!response.ok) {
-      const errorData = await response.json().catch(() => null);
-
-      if (response.status === 401) {
-        return Response.json(
-          {
-            error:
-              "Invalid API key. Please check your OPENROUTER_API_KEY environment variable.",
-          },
-          { status: 401 }
-        );
-      }
-
-      if (response.status === 429) {
-        return Response.json(
-          {
-            error:
-              "Rate limit exceeded. Please wait a moment and try again.",
-          },
-          { status: 429 }
-        );
-      }
-
-      return Response.json(
-        {
-          error:
-            errorData?.error?.message ||
-            `OpenRouter API error: ${response.status}`,
-        },
-        { status: response.status }
-      );
-    }
-
-    const data = await response.json();
-    const content = data.choices?.[0]?.message?.content;
-
-    if (!content) {
-      return Response.json(
-        { error: "No response from AI model. Please try again." },
-        { status: 502 }
-      );
-    }
-
-    let matches: MatchResult[];
-    try {
-      const jsonMatch = content.match(/\[[\s\S]*\]/);
-      if (!jsonMatch) {
-        throw new Error("No JSON array found in response");
-      }
-      matches = JSON.parse(jsonMatch[0]);
-    } catch {
-      return Response.json(
-        {
-          error:
-            "Failed to parse AI response. The model returned an unexpected format.",
-          rawResponse: content,
-        },
-        { status: 502 }
-      );
-    }
-
-    const enriched = matches.map((match) => {
-      const original = jobs.find((j) => j.slug === match.slug);
-      return {
-        ...match,
-        company: original?.company || "Unknown",
-        title: original?.title || "Unknown",
-        location: original?.location || "Unknown",
-        url: original?.url || "#",
-        tags: original?.tags || [],
-        remote: original?.remote || false,
-      };
-    });
-
-    return Response.json({ matches: enriched });
-  } catch (error) {
-    return Response.json(
-      {
-        error:
-          error instanceof Error
-            ? error.message
-            : "An unexpected error occurred while matching jobs",
-      },
-      { status: 500 }
-    );
-  }
+  return Response.json({ matches: top5 });
 }
